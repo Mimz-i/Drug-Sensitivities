@@ -1,0 +1,458 @@
+---
+title: "Mim's RNSseq STAR_RSEM ENSEMBL priming and gene expression correlations with full responders drug sensitivities - Brigimadlin - Carfilzomib - Docetaxel from qHTS results"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+
+```{r}
+# Transcriptome → Drug biomarker metrics & correlations: Brigimadlin / Carfilzomib / Docetaxel
+suppressPackageStartupMessages({
+  library(DESeq2); library(readr); library(dplyr); library(tidyr)
+  library(AnnotationDbi); library(org.Hs.eg.db)
+  library(ggplot2); library(ggrepel)
+  library(limma)     # removeBatchEffect
+  library(purrr)     # map_dfr
+  library(cowplot)   # optional
+})
+
+# INPUTS
+counts_tsv     <- "left_merged_STS_Batches_1_2_gene_counts.tsv"
+sampleinfo_csv <- "sampleinfo_STS_DrugSens_2025.csv"     # name, Batch, cell_type, (optional) Lineage
+
+brig_csv <- "brigimadlin_metrics.csv"    # cell_line, IC50_nM, AUC  (AUC: 1=death, 0=viability)
+cfz_csv  <- "carfilzomib_metrics.csv"    # cell_line, IC50_nM, AUC
+dtx_csv  <- "docetaxel_metrics.csv"      # cell_line, IC50_nM, AUC
+
+out_root <- file.path(getwd(), "drug_panels_results"); dir.create(out_root, FALSE, TRUE)
+
+# VST by cell line (re-use if already computed)
+ensure_vst_avg <- function() {
+  if (exists("vst_avg", inherits = TRUE)) return(get("vst_avg", inherits = TRUE))
+
+  sampleinfo <- readr::read_csv(sampleinfo_csv, show_col_types = FALSE)
+  stopifnot(all(c("name","Batch","cell_type") %in% names(sampleinfo)))
+
+  rsem_counts <- readr::read_tsv(counts_tsv, show_col_types = FALSE)
+  gene_ids    <- rsem_counts$gene_id
+  cnt_mat     <- rsem_counts |> dplyr::select(-1, -2) |> as.data.frame() |> as.matrix()
+  rownames(cnt_mat) <- gene_ids
+
+  stopifnot(all(colnames(cnt_mat) %in% sampleinfo$name))
+  sampleinfo <- sampleinfo[match(colnames(cnt_mat), sampleinfo$name), , drop = FALSE]
+  stopifnot(all(colnames(cnt_mat) == sampleinfo$name))
+
+  keep <- rowSums(cnt_mat >= 10) >= 4
+  cnt_mat <- cnt_mat[keep, , drop = FALSE]
+
+  sym_map <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = rownames(cnt_mat),
+                                   column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+  cnt_sym <- cnt_mat[!is.na(sym_map), , drop = FALSE]
+  rownames(cnt_sym) <- sym_map[!is.na(sym_map)]
+  cnt_sym <- rowsum(cnt_sym, group = rownames(cnt_sym))
+
+  sampleinfo$Batch     <- droplevels(factor(sampleinfo$Batch))
+  sampleinfo$cell_type <- droplevels(factor(sampleinfo$cell_type))
+
+  dds <- DESeqDataSetFromMatrix(countData = round(cnt_sym),
+                                colData   = sampleinfo,
+                                design    = ~ Batch + cell_type)
+  vsd <- vst(dds, blind = FALSE)
+  vst_mat <- assay(vsd)
+
+  vst_bc <- limma::removeBatchEffect(
+    vst_mat,
+    batch  = colData(vsd)$Batch,
+    design = model.matrix(~ cell_type, data = as.data.frame(colData(vsd)))
+  )
+
+  cell_types <- as.character(colData(vsd)$cell_type)
+  vst_df <- as.data.frame(vst_bc) |> tibble::rownames_to_column("gene")
+
+  vst_avg_local <- vst_df |>
+    tidyr::pivot_longer(-gene, names_to = "sample", values_to = "vst") |>
+    dplyr::mutate(cell_line = cell_types[match(sample, colnames(vst_bc))]) |>
+    dplyr::group_by(gene, cell_line) |>
+    dplyr::summarise(vst = mean(vst, na.rm = TRUE), .groups = "drop") |>
+    tidyr::pivot_wider(names_from = cell_line, values_from = vst)
+
+  readr::write_tsv(vst_avg_local, file.path(out_root, "expr_matrix_vst_by_cellline.tsv"))
+  assign("vst_avg", vst_avg_local, envir = .GlobalEnv)
+  vst_avg_local
+}
+
+vst_avg <- ensure_vst_avg()
+
+# Helper: long expression, z-score by gene across cell lines
+expr_long <- vst_avg |> tidyr::pivot_longer(-gene, names_to = "cell_line", values_to = "vst")
+mat_gxcl  <- vst_avg |> tibble::column_to_rownames("gene") |> as.matrix()
+z_gxcl    <- t(scale(t(mat_gxcl)))    # z-score per gene across cell lines
+z_df      <- as.data.frame(z_gxcl) |> tibble::rownames_to_column("gene")
+z_long    <- z_df |> tidyr::pivot_longer(-gene, names_to = "cell_line", values_to = "z")
+
+# DRUG-SPECIFIC PANELS
+
+# Brigimadlin (MDM2 inhibitor)
+# p53 transcriptional activity index (higher → more p53 activation → more sensitivity)
+# Core p53 targets (canonical, robust across contexts)
+p53_targets <- c("CDKN1A","MDM2","BBC3","PMAIP1","BAX","GADD45A","FAS")
+
+# TP53 / MDM2 mutation status (from my WES notes)
+tp53_mut_lines <- c("UPS2","DDLPS","LMS1","LMS2","MFS3")
+mdm2_mut_lines <- c("DDLPS")
+
+make_brig_metrics <- function() {
+  # mean z of p53 targets
+  present <- intersect(p53_targets, rownames(z_gxcl))
+  if (length(present) == 0) stop("None of the p53 target genes found in VST matrix.")
+  p53_index <- colMeans(z_gxcl[present, , drop = FALSE], na.rm = TRUE)
+  tibble::tibble(
+    cell_line = names(p53_index),
+    p53_target_z = as.numeric(p53_index)
+  )
+}
+
+# Carfilzomib (proteasome inhibitor)
+# Positive set (↑ → sensitivity): proteasome addiction/UPR stress proxies
+cfz_pos <- c("PSMB5","PSMB1","PSMA1","PSMA3","PSMC4","HSPA5","XBP1","DDIT3")
+# Negative set (↑ → resistance): multidrug efflux
+cfz_neg <- c("ABCB1","ABCG2")
+
+make_cfz_metrics <- function() {
+  pos <- intersect(cfz_pos, rownames(z_gxcl))
+  neg <- intersect(cfz_neg, rownames(z_gxcl))
+  stopifnot(length(c(pos, neg)) > 0)
+  pos_mean <- if (length(pos)) colMeans(z_gxcl[pos, , drop = FALSE], na.rm = TRUE) else rep(NA_real_, ncol(z_gxcl))
+  neg_mean <- if (length(neg)) colMeans(z_gxcl[neg, , drop = FALSE], na.rm = TRUE) else rep(NA_real_, ncol(z_gxcl))
+  tibble::tibble(
+    cell_line = colnames(z_gxcl),
+    CFZ_index = as.numeric(pos_mean) - as.numeric(neg_mean)
+  )
+}
+
+# Docetaxel (anti-mitotic taxane)
+# Positive set (↑ → sensitivity): proliferation/mitotic checkpoint
+dtx_pos <- c("AURKA","AURKB","BUB1","CDC20","CCNB1","KIF11","MKI67")
+# Negative set (↑ → resistance): efflux + class III beta-tubulin
+dtx_neg <- c("ABCB1","ABCG2","TUBB3")
+
+make_dtx_metrics <- function() {
+  pos <- intersect(dtx_pos, rownames(z_gxcl))
+  neg <- intersect(dtx_neg, rownames(z_gxcl))
+  stopifnot(length(c(pos, neg)) > 0)
+  pos_mean <- if (length(pos)) colMeans(z_gxcl[pos, , drop = FALSE], na.rm = TRUE) else rep(NA_real_, ncol(z_gxcl))
+  neg_mean <- if (length(neg)) colMeans(z_gxcl[neg, , drop = FALSE], na.rm = TRUE) else rep(NA_real_, ncol(z_gxcl))
+  tibble::tibble(
+    cell_line = colnames(z_gxcl),
+    DTX_index = as.numeric(pos_mean) - as.numeric(neg_mean)
+  )
+}
+
+# IO helpers (drug tables, stats, plotting)
+read_drug_table <- function(csv_path) {
+  readr::read_csv(
+    csv_path,
+    col_types = readr::cols(
+      cell_line = readr::col_character(),
+      IC50_nM   = readr::col_double(),
+      AUC       = readr::col_double()
+    )
+  ) |>
+    dplyr::mutate(
+      AUC_death     = AUC,
+      AUC_viability = 1 - AUC
+    )
+}
+
+summarize_corr <- function(df, x, y) {
+  sub <- df |> dplyr::select(x = !!rlang::sym(x), y = !!rlang::sym(y)) |> tidyr::drop_na()
+  n   <- nrow(sub)
+  pe  <- if (n >= 3) suppressWarnings(cor.test(sub$x, sub$y, method = "pearson"))  else NULL
+  sp  <- if (n >= 3) suppressWarnings(cor.test(sub$x, sub$y, method = "spearman")) else NULL
+  tibble::tibble(
+    n            = n,
+    pearson_r    = if (!is.null(pe)) unname(pe$estimate) else NA_real_,
+    pearson_p    = if (!is.null(pe)) pe$p.value          else NA_real_,
+    pearson_r2   = if (!is.null(pe)) unname(pe$estimate)^2 else NA_real_,
+    spearman_rho = if (!is.null(sp)) unname(sp$estimate) else NA_real_,
+    spearman_p   = if (!is.null(sp)) sp$p.value          else NA_real_
+  )
+}
+
+get_stats_label <- function(stats_df, metric, endpoint) {
+  row <- stats_df |> dplyr::filter(metric == !!metric, endpoint == !!endpoint)
+  if (nrow(row) != 1) return("n = NA\nr = NA (p=NA),  r² = NA\nρ = NA (p=NA)")
+  fmt <- function(x, d = 2) {
+    x <- as.numeric(x)
+    if (is.na(x)) "NA" else if (x < 1e-3) formatC(x, format = "e", digits = 1) else formatC(x, format = "f", digits = d)
+  }
+  paste0(
+    "n = ", row$n,
+    "\nr = ", fmt(row$pearson_r), " (p=", fmt(row$pearson_p), "),  r² = ", fmt(row$pearson_r2),
+    "\nρ = ", fmt(row$spearman_rho), " (p=", fmt(row$spearman_p), ")"
+  )
+}
+
+plot_one <- function(dat, xvar, yvar, title_prefix = "", stats_df = NULL, stamp = TRUE,
+                     color_mut = FALSE, y_ic50_range = NULL, y_auc_range = NULL) {
+
+  df <- dat |>
+    dplyr::select(cell_line, x = !!rlang::sym(xvar), y = !!rlang::sym(yvar),
+                  dplyr::any_of(c("TP53_status","MDM2_status"))) |>
+    tidyr::drop_na()
+
+  # label anchor (mean per cell_line if replicates exist)
+  df_lab <- df |>
+    dplyr::group_by(cell_line) |>
+    dplyr::summarise(x = mean(x, na.rm = TRUE), y = mean(y, na.rm = TRUE), .groups = "drop")
+
+  # main plot
+  p <- ggplot(df, aes(x, y)) +
+    geom_point(size = 2.6, alpha = 0.50) +
+    ggrepel::geom_text_repel(data = df_lab, aes(label = cell_line),
+                             size = 3.2, max.overlaps = Inf, seed = 42) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.6) +
+    labs(title = paste(title_prefix, paste(yvar, "vs", xvar)), x = xvar, y = yvar) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "none", plot.margin = margin(10, 10, 10, 10))
+
+  # optional color/shape for TP53/MDM2 (used for Brigimadlin)
+  if (color_mut && all(c("TP53_status","MDM2_status") %in% names(df))) {
+    df_wt  <- dplyr::filter(df, TP53_status == "WT")
+    df_mut <- dplyr::filter(df, TP53_status == "Mut") |>
+              dplyr::mutate(shape = ifelse(MDM2_status == "Mut", 17, 1))  # triangle for MDM2-mut, open circle otherwise
+
+    p <- ggplot() +
+      geom_point(data = df_mut, aes(x, y, shape = factor(shape)),
+                 alpha = 0.55, size = 2.6, colour = "grey40", stroke = 0.6) +
+      scale_shape_identity(guide = "none") +
+      geom_point(data = df_wt, aes(x, y), alpha = 0.9, size = 2.8) +
+      ggrepel::geom_text_repel(data = df_lab, aes(x, y, label = cell_line),
+                               size = 3.2, max.overlaps = Inf, seed = 42) +
+      geom_smooth(data = df_wt, aes(x, y), method = "lm", se = FALSE, linewidth = 0.6) +
+      labs(title = paste(title_prefix, paste(yvar, "vs", xvar)),
+           subtitle = "Fit shown for TP53-WT only; TP53-mut shown as grey; triangles = MDM2-mut",
+           x = xvar, y = yvar) +
+      theme_minimal(base_size = 12) +
+      theme(legend.position = "none", plot.margin = margin(10, 10, 10, 10))
+  }
+
+  # consistent Y limits if provided
+  if (!is.null(y_ic50_range) && yvar == "IC50_nM") p <- p + scale_y_continuous(limits = y_ic50_range)
+  if (!is.null(y_auc_range)  && yvar %in% c("AUC_death","AUC_viability")) p <- p + scale_y_continuous(limits = y_auc_range)
+
+  if (!stamp || is.null(stats_df)) return(p)
+
+  # side stamp
+  stats_lab <- get_stats_label(stats_df, metric = xvar, endpoint = yvar)
+  nl   <- length(strsplit(stats_lab, "\n")[[1]])
+  s_w  <- 0.18
+  s_h  <- min(0.45, max(0.22, 0.055 * nl + 0.06))
+  s_y  <- (1 - s_h) / 2
+  stamp_plot <- ggplot() +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
+    theme_void() +
+    annotate("rect", xmin = 0, xmax = 1, ymin = 0, ymax = 1,
+             fill = "white", alpha = 1, colour = "grey85", linewidth = 0.35) +
+    annotate("text", x = 0.04, y = 0.5, hjust = 0, vjust = 0.5,
+             label = stats_lab, size = 2.4, lineheight = 1.05)
+
+  cowplot::ggdraw() +
+    cowplot::draw_plot(p,           x = 0,        y = 0,   width = 1 - s_w, height = 1, hjust = 0, vjust = 0) +
+    cowplot::draw_plot(stamp_plot,  x = 1 - s_w,  y = s_y, width = s_w,     height = s_h, hjust = 0, vjust = 0)
+}
+
+save_plot <- function(p, file, w = 7.2, h = 5.0, dpi = 600) {
+  dir.create(dirname(file), showWarnings = FALSE, recursive = TRUE)
+  ggsave(file, p, width = w, height = h, dpi = dpi)
+}
+
+# BRIGIMADLIN
+{
+  out_dir <- file.path(out_root, "brigimadlin"); dir.create(out_dir, FALSE, TRUE)
+  brig_metrics <- make_brig_metrics()
+  drug_brig    <- read_drug_table(brig_csv)
+
+  dat_brig <- dplyr::inner_join(drug_brig, brig_metrics, by = "cell_line") |>
+    dplyr::mutate(
+      TP53_status = ifelse(cell_line %in% tp53_mut_lines, "Mut", "WT"),
+      MDM2_status = ifelse(cell_line %in% mdm2_mut_lines, "Mut", "WT")
+    )
+
+  readr::write_csv(brig_metrics, file.path(out_dir, "brigimadlin_biomarkers.csv"))
+
+  # correlations: All lines & TP53-WT subset
+  metrics   <- c("p53_target_z")
+  endpoints <- c("IC50_nM","AUC_death","AUC_viability")
+
+  corr_all <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      sub <- dat_brig |> dplyr::select(all_of(c("cell_line", m, e))) |> tidyr::drop_na()
+      tibble::tibble(
+        TP53_status = "All", metric = m, endpoint = e, n = nrow(sub),
+        pearson  = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "pearson")  else NA_real_,
+        spearman = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "spearman") else NA_real_
+      )
+    })
+  })
+
+  corr_wt  <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      sub <- dat_brig |> dplyr::filter(TP53_status == "WT") |>
+        dplyr::select(all_of(c("cell_line", m, e))) |> tidyr::drop_na()
+      tibble::tibble(
+        TP53_status = "WT", metric = m, endpoint = e, n = nrow(sub),
+        pearson  = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "pearson")  else NA_real_,
+        spearman = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "spearman") else NA_real_
+      )
+    })
+  })
+
+  readr::write_csv(dplyr::bind_rows(corr_all, corr_wt),
+                   file.path(out_dir, "brigimadlin_correlations_by_TP53status.csv"))
+
+  # detailed stats for stamps (All & WT)
+  det_all <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      summarize_corr(dat_brig |> dplyr::select(all_of(c(m, e))) |> tidyr::drop_na(), m, e) |>
+        dplyr::mutate(metric = m, endpoint = e, TP53_status = "All", .before = 1)
+    })
+  })
+  det_wt <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      dfw <- dat_brig |> dplyr::filter(TP53_status == "WT")
+      summarize_corr(dfw |> dplyr::select(all_of(c(m, e))) |> tidyr::drop_na(), m, e) |>
+        dplyr::mutate(metric = m, endpoint = e, TP53_status = "WT", .before = 1)
+    })
+  })
+  det_all <- det_all |> dplyr::mutate(across(where(is.double), as.numeric))
+  det_wt  <- det_wt  |> dplyr::mutate(across(where(is.double), as.numeric))
+  readr::write_csv(dplyr::bind_rows(det_all, det_wt),
+                   file.path(out_dir, "brigimadlin_correlations_detailed.csv"))
+
+  # Y ranges for consistency
+  y_ic50_range <- range(dat_brig$IC50_nM, na.rm = TRUE)
+  y_auc_range  <- range(c(dat_brig$AUC_death, dat_brig$AUC_viability), na.rm = TRUE)
+
+  # plots (show TP53-mut in grey; fit on WT)
+  for (e in endpoints) {
+    stats_df_all <- det_all |> dplyr::filter(TP53_status == "All")
+    p1 <- plot_one(dat_brig, "p53_target_z", e, title_prefix = "Brigimadlin:",
+                   stats_df = stats_df_all, stamp = TRUE, color_mut = TRUE,
+                   y_ic50_range = y_ic50_range, y_auc_range = y_auc_range)
+    save_plot(p1, file.path(out_dir, paste0(e, "_vs_p53_target_z_ALL.png")))
+
+    stats_df_wt <- det_wt |> dplyr::filter(TP53_status == "WT")
+    p2 <- plot_one(dat_brig |> dplyr::filter(TP53_status == "WT"),
+                   "p53_target_z", e, title_prefix = "Brigimadlin (TP53-WT only):",
+                   stats_df = stats_df_wt, stamp = TRUE, color_mut = FALSE,
+                   y_ic50_range = y_ic50_range, y_auc_range = y_auc_range)
+    save_plot(p2, file.path(out_dir, paste0(e, "_vs_p53_target_z_WT.png")))
+  }
+}
+
+# CARFILZOMIB
+{
+  out_dir <- file.path(out_root, "carfilzomib"); dir.create(out_dir, FALSE, TRUE)
+  cfz_metrics <- make_cfz_metrics()
+  readr::write_csv(cfz_metrics, file.path(out_dir, "carfilzomib_biomarkers.csv"))
+
+  drug_cfz <- read_drug_table(cfz_csv)
+  dat_cfz  <- dplyr::inner_join(drug_cfz, cfz_metrics, by = "cell_line")
+
+  metrics   <- c("CFZ_index")
+  endpoints <- c("IC50_nM","AUC_death","AUC_viability")
+
+  corr_tbl <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      sub <- dat_cfz |> dplyr::select(all_of(c("cell_line", m, e))) |> tidyr::drop_na()
+      tibble::tibble(
+        metric = m, endpoint = e, n = nrow(sub),
+        pearson = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "pearson") else NA_real_,
+        spearman = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "spearman") else NA_real_
+      )
+    })
+  })
+  readr::write_csv(corr_tbl, file.path(out_dir, "carfilzomib_correlations.csv"))
+
+  det <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      summarize_corr(dat_cfz, m, e) |> dplyr::mutate(metric = m, endpoint = e, .before = 1)
+    })
+  }) |> dplyr::mutate(across(where(is.double), as.numeric))
+  readr::write_csv(det, file.path(out_dir, "carfilzomib_correlations_detailed.csv"))
+
+  y_ic50_range <- range(dat_cfz$IC50_nM, na.rm = TRUE)
+  y_auc_range  <- range(c(dat_cfz$AUC_death, dat_cfz$AUC_viability), na.rm = TRUE)
+
+  for (e in endpoints) {
+    p <- plot_one(dat_cfz, "CFZ_index", e, title_prefix = "Carfilzomib:",
+                  stats_df = det, stamp = TRUE,
+                  y_ic50_range = y_ic50_range, y_auc_range = y_auc_range)
+    save_plot(p, file.path(out_dir, paste0(e, "_vs_CFZ_index.png")))
+  }
+}
+
+# DOCETAXEL
+{
+  out_dir <- file.path(out_root, "docetaxel"); dir.create(out_dir, FALSE, TRUE)
+  dtx_metrics <- make_dtx_metrics()
+  readr::write_csv(dtx_metrics, file.path(out_dir, "docetaxel_biomarkers.csv"))
+
+  drug_dtx <- read_drug_table(dtx_csv)
+  dat_dtx  <- dplyr::inner_join(drug_dtx, dtx_metrics, by = "cell_line")
+
+  metrics   <- c("DTX_index")
+  endpoints <- c("IC50_nM","AUC_death","AUC_viability")
+
+  corr_tbl <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      sub <- dat_dtx |> dplyr::select(all_of(c("cell_line", m, e))) |> tidyr::drop_na()
+      tibble::tibble(
+        metric = m, endpoint = e, n = nrow(sub),
+        pearson = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "pearson") else NA_real_,
+        spearman = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "spearman") else NA_real_
+      )
+    })
+  })
+  readr::write_csv(corr_tbl, file.path(out_dir, "docetaxel_correlations.csv"))
+
+  det <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      summarize_corr(dat_dtx, m, e) |> dplyr::mutate(metric = m, endpoint = e, .before = 1)
+    })
+  }) |> dplyr::mutate(across(where(is.double), as.numeric))
+  readr::write_csv(det, file.path(out_dir, "docetaxel_correlations_detailed.csv"))
+
+  y_ic50_range <- range(dat_dtx$IC50_nM, na.rm = TRUE)
+  y_auc_range  <- range(c(dat_dtx$AUC_death, dat_dtx$AUC_viability), na.rm = TRUE)
+
+  for (e in endpoints) {
+    p <- plot_one(dat_dtx, "DTX_index", e, title_prefix = "Docetaxel:",
+                  stats_df = det, stamp = TRUE,
+                  y_ic50_range = y_ic50_range, y_auc_range = y_auc_range)
+    save_plot(p, file.path(out_dir, paste0(e, "_vs_DTX_index.png")))
+  }
+}
+
+message(
+  "\nDone. Outputs in: ", out_root,
+  "\n- expr_matrix_vst_by_cellline.tsv",
+  "\n- brigimadlin_biomarkers.csv / carfilzomib_biomarkers.csv / docetaxel_biomarkers.csv",
+  "\n- *correlations.csv and *correlations_detailed.csv for each drug",
+  "\n- PNG plots with one label per cell line (Brigimadlin also includes TP53-WT fit and WT-only plots)\n"
+)
+
+```
+
