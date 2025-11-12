@@ -1,0 +1,443 @@
+---
+title: "Mim's RNSseq STAR_RSEM ENSEMBL priming and gene expression correlations with Obatoclax drug sensitivities from qHTS results"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+
+```{r}
+# Minimal pipeline: VST → priming + responder panel → OBX correlations
+suppressPackageStartupMessages({
+  library(DESeq2); library(readr); library(dplyr); library(tidyr)
+  library(AnnotationDbi); library(org.Hs.eg.db)
+  library(ggplot2); library(ggrepel)
+  library(limma)     # removeBatchEffect
+  library(purrr)     # map_dfr
+  library(cowplot)   # side stamp composition
+  library(stringr);  library(broom); library(tibble)
+})
+
+# INPUTS
+counts_tsv     <- "left_merged_STS_Batches_1_2_gene_counts.tsv"
+sampleinfo_csv <- "sampleinfo_STS_DrugSens_2025.csv"   # name, Batch, cell_type, (optional) Lineage
+obx_csv        <- "obx_metrics.csv"                    # cell_line, IC50_nM, AUC (AUC: 1=death, 0=viability)
+out_root       <- file.path(getwd(), "obx_priming_results_plus_panel"); dir.create(out_root, FALSE, TRUE)
+
+# Load counts + sample metadata
+sampleinfo <- readr::read_csv(sampleinfo_csv, show_col_types = FALSE)
+stopifnot(all(c("name","Batch","cell_type") %in% names(sampleinfo)))
+
+rsem_counts <- readr::read_tsv(counts_tsv, show_col_types = FALSE)
+gene_ids    <- rsem_counts$gene_id
+cnt_mat     <- rsem_counts |> dplyr::select(-1, -2) |> as.data.frame() |> as.matrix()
+rownames(cnt_mat) <- gene_ids
+
+# keep only samples present in sampleinfo$name (order must match)
+stopifnot(all(colnames(cnt_mat) %in% sampleinfo$name))
+sampleinfo <- sampleinfo[match(colnames(cnt_mat), sampleinfo$name), , drop = FALSE]
+stopifnot(all(colnames(cnt_mat) == sampleinfo$name))
+
+# quick filter: ≥10 counts in ≥4 samples
+keep <- rowSums(cnt_mat >= 10) >= 4
+cnt_mat <- cnt_mat[keep, , drop = FALSE]
+
+# Map to SYMBOLs (uppercased) and collapse duplicates
+sym_map <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = rownames(cnt_mat),
+                                 column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+cnt_sym <- cnt_mat[!is.na(sym_map), , drop = FALSE]
+rownames(cnt_sym) <- toupper(sym_map[!is.na(sym_map)])
+cnt_sym <- rowsum(cnt_sym, group = rownames(cnt_sym))
+
+# DESeq2 object and VST (blind=FALSE)
+sampleinfo$Batch     <- droplevels(factor(sampleinfo$Batch))
+sampleinfo$cell_type <- droplevels(factor(sampleinfo$cell_type))
+
+dds <- DESeqDataSetFromMatrix(countData = round(cnt_sym),
+                              colData   = sampleinfo,
+                              design    = ~ Batch + cell_type)
+vsd <- vst(dds, blind = FALSE)
+vst_mat <- assay(vsd)
+
+# Optional: remove batch for downstream correlations (viz/metrics only)
+vst_bc <- limma::removeBatchEffect(
+  vst_mat,
+  batch  = colData(vsd)$Batch,
+  design = model.matrix(~ cell_type, data = as.data.frame(colData(vsd)))
+)
+
+# Collapse replicates → one column per cell line
+cell_types <- as.character(colData(vsd)$cell_type)
+vst_df <- as.data.frame(vst_bc) |> tibble::rownames_to_column("gene")
+
+vst_avg <- vst_df |>
+  tidyr::pivot_longer(-gene, names_to = "sample", values_to = "vst") |>
+  dplyr::mutate(cell_line = cell_types[match(sample, colnames(vst_bc))]) |>
+  dplyr::group_by(gene, cell_line) |>
+  dplyr::summarise(vst = mean(vst, na.rm = TRUE), .groups = "drop") |>
+  tidyr::pivot_wider(names_from = cell_line, values_from = vst)
+
+# Save the averaged VST matrix (genes × cell_line)
+expr_tsv <- file.path(out_root, "expr_matrix_vst_by_cellline.tsv")
+readr::write_tsv(vst_avg, expr_tsv)
+
+# Classic priming metrics (unchanged)
+pro_apop  <- c("BCL2L11","BBC3","BID","PMAIP1")               # BIM, PUMA, BID, NOXA
+anti_apop <- c("BCL2","BCL2L1","MCL1","BCL2A1","BCL2L2")
+
+expr_long <- vst_avg |>
+  tidyr::pivot_longer(-gene, names_to = "cell_line", values_to = "vst")
+
+vst_metrics <- expr_long |>
+  dplyr::filter(gene %in% c(pro_apop, anti_apop, "PMAIP1", "MCL1")) |>
+  dplyr::group_by(cell_line) |>
+  dplyr::summarise(
+    pro_mean_vst  = mean(vst[gene %in% pro_apop],  na.rm = TRUE),
+    anti_mean_vst = mean(vst[gene %in% anti_apop], na.rm = TRUE),
+    NOXA_vst      = vst[match("PMAIP1", gene)],
+    MCL1_vst      = vst[match("MCL1",   gene)],
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    priming_index_vst  = pro_mean_vst - anti_mean_vst,
+    NOXA_MCL1_logratio = NOXA_vst - MCL1_vst
+  ) |>
+  dplyr::select(cell_line, priming_index_vst, NOXA_MCL1_logratio)
+
+# NEW Responder-panel signature (based on responders vs non-reposnders DEGs)
+# Define UP/DOWN lists in R (my lists)
+up_raw <- c(
+  "BIRC3","BID","BCL2A1","ATG14","HTRA2","ATF4","BCL2L1","BOK","USP9X","BBC3",
+  "PMAIP1","PPP1R15A","CTSL","MTOR","AKT2","BAX","BIRC5","XBP1","RHEB","FBXW7",
+  "PIK3R4","BIRC6","CASP9","PIK3C3","ATG7","ABCG2","DIABLO","RICTOR","BCL2L2",
+  "TFEB","BCL2L11","TSC2","GABARAP","GSK3B","BNIP3L","BECN1"
+)
+
+down_raw <- c(
+  "ABCB1","ABCC1","AKT1","APAF1","ATF4","ATF6","ATG12","ATG5","BAD","BAK1",
+  "BCL2","BIRC2","BIRC3","BMF","BNIP3","CASP2","CASP3","CASP7","CASP8","CDK9",
+  "CTSL","DDIT3","EIF2AK3","ERN1","FBXW7","GABARAPL1","HSPA5","HUWE1","LAMP1",
+  "LAMP2","MAP1LC3B","MCL1","OPTN","PIK3C3","PIK3CA","PIK3CB","PTEN","RPTOR",
+  "SQSTM1","TFE3","TSC1","UVRAG","XIAP"
+)
+
+norm_syms <- function(x) unique(na.omit(trimws(toupper(as.character(x)))))
+up_raw   <- norm_syms(up_raw)
+down_raw <- norm_syms(down_raw)
+
+# Remove genes appearing in both UP and DOWN (avoid contradictions)
+overlap <- intersect(up_raw, down_raw)
+if (length(overlap)) {
+  message("Responder panel: removing ", length(overlap),
+          " conflicting genes present in both UP and DOWN: ",
+          paste(overlap, collapse = ", "))
+}
+panel_up   <- setdiff(up_raw,   overlap)
+panel_down <- setdiff(down_raw, overlap)
+
+# Extract panel matrix from VST (rows = genes, cols = cell lines)
+panel_all <- unique(c(panel_up, panel_down))
+panel_mat <- vst_avg |>
+  dplyr::filter(gene %in% panel_all) |>
+  tibble::column_to_rownames("gene") |>
+  as.matrix()
+
+# z-score each gene across cell lines (row-wise)
+panel_z <- t(scale(t(panel_mat)))
+
+# Present genes after expression availability
+up_present   <- intersect(panel_up,   rownames(panel_z))
+down_present <- intersect(panel_down, rownames(panel_z))
+
+# Composite: mean(z of UP) − mean(z of DOWN), per cell line
+obxsig <- tibble::tibble(cell_line = colnames(panel_z)) |>
+  dplyr::mutate(
+    z_up_mean   = if (length(up_present))   base::colMeans(panel_z[up_present, , drop = FALSE],   na.rm = TRUE) else NA_real_,
+    z_down_mean = if (length(down_present)) base::colMeans(panel_z[down_present, , drop = FALSE], na.rm = TRUE) else NA_real_,
+    OBXsig_signed_z = z_up_mean - z_down_mean
+  )
+
+# Optional transparency exports
+readr::write_lines(up_present,    file.path(out_root, "panel_UP_present.txt"))
+readr::write_lines(down_present,  file.path(out_root, "panel_DOWN_present.txt"))
+readr::write_lines(setdiff(panel_up,   up_present),   file.path(out_root, "panel_UP_missing.txt"))
+readr::write_lines(setdiff(panel_down, down_present), file.path(out_root, "panel_DOWN_missing.txt"))
+readr::write_tsv(as.data.frame(panel_z) |> tibble::rownames_to_column("gene"),
+                 file.path(out_root, "panel_gene_by_cellline_zscores.tsv"))
+
+# Correlate with OBX IC50 / AUC (death-scale & AUC-1)
+drug <- readr::read_csv(
+  obx_csv,
+  col_types = readr::cols(
+    cell_line = readr::col_character(),
+    IC50_nM   = readr::col_double(),
+    AUC       = readr::col_double()
+  )
+) |>
+  dplyr::mutate(
+    AUC_death     = AUC,        # 1 = death, 0 = viability
+    AUC_viability = 1 - AUC     # AUC-1
+  )
+
+dat <- drug |>
+  dplyr::inner_join(vst_metrics, by = "cell_line") |>
+  dplyr::inner_join(obxsig,      by = "cell_line")
+
+# choose metrics to test (now includes OBXsig)
+metrics   <- c("priming_index_vst","NOXA_MCL1_logratio","OBXsig_signed_z")
+endpoints <- c("IC50_nM","AUC_death","AUC_viability")
+
+# quick table (rho/r)
+corr_tbl <- purrr::map_dfr(metrics, function(m) {
+  purrr::map_dfr(endpoints, function(e) {
+    sub <- dat |> dplyr::select(all_of(c("cell_line", m, e))) |> tidyr::drop_na()
+    tibble::tibble(
+      metric    = m,
+      endpoint  = e,
+      n         = nrow(sub),
+      spearman  = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "spearman") else NA_real_,
+      pearson   = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "pearson")  else NA_real_
+    )
+  })
+})
+readr::write_csv(corr_tbl, file.path(out_root, "obx_correlations.csv"))
+
+# Detailed stats (saved & reused for plot stamps)
+summarize_corr <- function(df, x, y) {
+  sub <- df |> dplyr::select(x = !!rlang::sym(x), y = !!rlang::sym(y)) |> tidyr::drop_na()
+  n   <- nrow(sub)
+  pe  <- if (n >= 3) suppressWarnings(cor.test(sub$x, sub$y, method = "pearson"))  else NULL
+  sp  <- if (n >= 3) suppressWarnings(cor.test(sub$x, sub$y, method = "spearman")) else NULL
+  tibble::tibble(
+    n            = n,
+    pearson_r    = if (!is.null(pe)) unname(pe$estimate) else NA_real_,
+    pearson_p    = if (!is.null(pe)) pe$p.value          else NA_real_,
+    pearson_r2   = if (!is.null(pe)) unname(pe$estimate)^2 else NA_real_,
+    pearson_ci_l = if (!is.null(pe) && !is.null(pe$conf.int)) pe$conf.int[1] else NA_real_,
+    pearson_ci_u = if (!is.null(pe) && !is.null(pe$conf.int)) pe$conf.int[2] else NA_real_,
+    spearman_rho = if (!is.null(sp)) unname(sp$estimate) else NA_real_,
+    spearman_p   = if (!is.null(sp)) sp$p.value          else NA_real_
+  )
+}
+
+corr_detailed <- purrr::map_dfr(metrics, function(m) {
+  purrr::map_dfr(endpoints, function(e) {
+    summarize_corr(dat, m, e) |> dplyr::mutate(metric = m, endpoint = e, .before = 1)
+  })
+})
+corr_detailed_num <- corr_detailed |>
+  dplyr::mutate(
+    n            = as.integer(n),
+    pearson_r    = as.numeric(pearson_r),
+    pearson_p    = as.numeric(pearson_p),
+    pearson_r2   = as.numeric(pearson_r2),
+    pearson_ci_l = as.numeric(pearson_ci_l),
+    pearson_ci_u = as.numeric(pearson_ci_u),
+    spearman_rho = as.numeric(spearman_rho),
+    spearman_p   = as.numeric(spearman_p)
+  )
+readr::write_csv(corr_detailed_num, file.path(out_root, "obx_correlations_detailed.csv"))
+
+# Shared Y-axis ranges (IC50 & force AUC in [0,1])
+y_ic50_range <- range(dat$IC50_nM, na.rm = TRUE)
+y_auc_range  <- c(0, 1)  # fixed
+
+# Plotting helper: stamps read FROM saved table
+get_stats_label <- function(metric, endpoint, stats_df = corr_detailed_num) {
+  row <- stats_df |> dplyr::filter(metric == !!metric, endpoint == !!endpoint)
+  if (nrow(row) != 1) return("n = NA\nr = NA (p=NA),  r² = NA\nρ = NA (p=NA)")
+  fmt <- function(x, d = 2) {
+    x <- as.numeric(x)
+    if (is.na(x)) "NA" else if (x < 1e-3) formatC(x, format = "e", digits = 1) else formatC(x, format = "f", digits = d)
+  }
+  paste0(
+    "n = ", row$n,
+    "\nr = ", fmt(row$pearson_r), " (p=", fmt(row$pearson_p), "),  r² = ", fmt(row$pearson_r2),
+    "\nρ = ", fmt(row$spearman_rho), " (p=", fmt(row$spearman_p), ")"
+  )
+}
+
+# Plot one label per unique cell_line + compact side stamp
+plot_one_cellline_labels <- function(xvar, yvar, data = dat, label_agg = c("mean","median")) {
+  label_agg <- match.arg(label_agg)
+  agg_fun <- if (label_agg == "median") stats::median else base::mean
+
+  df <- data |>
+    dplyr::select(cell_line, x = !!rlang::sym(xvar), y = !!rlang::sym(yvar)) |>
+    tidyr::drop_na()
+
+  df_lab <- df |>
+    dplyr::group_by(cell_line) |>
+    dplyr::summarise(
+      x = agg_fun(x, na.rm = TRUE),
+      y = agg_fun(y, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  stats_lab <- get_stats_label(metric = xvar, endpoint = yvar, stats_df = corr_detailed_num)
+
+  y_limits <- if (yvar == "IC50_nM") y_ic50_range else
+              if (yvar %in% c("AUC_death","AUC_viability")) y_auc_range else NULL
+
+  n_labs <- nrow(df_lab)
+  txt_sz <- if (n_labs <= 10) 3.8 else if (n_labs <= 20) 3.2 else if (n_labs <= 35) 2.8 else 2.6
+  base_w <- if (n_labs <= 12) 6.6 else if (n_labs <= 24) 7.4 else 8.2
+  base_h <- if (n_labs <= 12) 4.6 else if (n_labs <= 24) 5.1 else 5.6
+
+  pretty_metric <- dplyr::case_when(
+    xvar == "priming_index_vst"  ~ "Priming Index",
+    xvar == "NOXA_MCL1_logratio" ~ "NOXA/MCL1 log-ratio",
+    xvar == "OBXsig_signed_z"    ~ "Responder-panel signature (signed z)"
+  )
+  subtitle <- if (yvar == "IC50_nM") {
+    paste0("Expectation: higher ", pretty_metric, " → lower IC50 (negative correlation)")
+  } else if (yvar == "AUC_death") {
+    paste0("Expectation: higher ", pretty_metric, " → higher AUC_death (positive correlation)")
+  } else if (yvar == "AUC_viability") {
+    paste0("Expectation: higher ", pretty_metric, " → lower AUC_viability (negative correlation)")
+  } else { "" }
+
+  p_main <- ggplot() +
+    geom_point(data = df, aes(x = x, y = y), size = 2.4, alpha = 0.45) +
+    geom_point(data = df_lab, aes(x = x, y = y), size = 2.8, alpha = 0.9) +
+    ggrepel::geom_text_repel(
+      data = df_lab, aes(x = x, y = y, label = cell_line),
+      max.overlaps = Inf, size = txt_sz, label.size = NA,
+      label.padding = grid::unit(0.15, "lines"),
+      box.padding   = grid::unit(0.35, "lines"),
+      point.padding = grid::unit(0.15, "lines"),
+      min.segment.length = 0, segment.size = 0.25,
+      seed = 42, force = 0.6, force_pull = 0.4
+    ) +
+    geom_smooth(data = df, aes(x = x, y = y), method = "lm", se = FALSE, linewidth = 0.6) +
+    { if (is.null(y_limits)) scale_y_continuous() else scale_y_continuous(limits = y_limits) } +
+    labs(x = xvar, y = yvar, title = paste("Obatoclax:", yvar, "vs", xvar), subtitle = subtitle) +
+    theme_minimal(base_size = 12) +
+    theme(plot.margin = margin(10, 10, 10, 10), legend.position = "none")
+
+  # Compact side stamp (no CI) – centered and narrow
+  nl   <- length(strsplit(stats_lab, "\n")[[1]])
+  s_w  <- 0.20
+  s_h  <- min(0.45, max(0.22, 0.055 * nl + 0.06))
+  s_y  <- (1 - s_h) / 2
+
+  stamp_plot <- ggplot() +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
+    theme_void() +
+    annotate("rect", xmin = 0, xmax = 1, ymin = 0, ymax = 1,
+             fill = "white", alpha = 1, colour = "grey85", linewidth = 0.35) +
+    annotate("text", x = 0.04, y = 0.5, hjust = 0, vjust = 0.5,
+             label = stats_lab, size = 2.4, lineheight = 1.05)
+
+  p_final <- cowplot::ggdraw() +
+    cowplot::draw_plot(p_main,     x = 0,        y = 0,   width = 1 - s_w, height = 1, hjust = 0, vjust = 0) +
+    cowplot::draw_plot(stamp_plot, x = 1 - s_w,  y = s_y, width = s_w,     height = s_h, hjust = 0, vjust = 0)
+
+  dir.create(file.path(out_root, "plots"), showWarnings = FALSE, recursive = TRUE)
+  fn <- file.path(out_root, "plots",
+                  paste0(yvar, "_vs_", xvar, "_ONE_LABEL_PER_CELL_LINE.png"))
+  ggsave(fn, p_final, width = base_w + 0.9, height = base_h, dpi = 600)
+  p_final
+}
+
+# Build all panels (IC50, AUC_death, AUC_viability) with BOTH metrics
+for (m in c("priming_index_vst","NOXA_MCL1_logratio","OBXsig_signed_z")) {
+  for (e in c("IC50_nM","AUC_death","AUC_viability")) {
+    plot_one_cellline_labels(m, e, data = dat, label_agg = "mean")
+  }
+}
+
+# Extra exports
+readr::write_csv(vst_metrics, file.path(out_root, "priming_metrics_vst.csv"))
+readr::write_csv(obxsig,      file.path(out_root, "obxsig_panel_metrics.csv"))
+
+# Per-cell line residual summaries & interpretation
+# (for both Priming Index and OBXsig, across IC50/AUC endpoints)
+per_line <- dat %>%
+  dplyr::select(
+    cell_line,
+    priming_index_vst, NOXA_MCL1_logratio, OBXsig_signed_z,
+    IC50_nM, AUC_death, AUC_viability
+  ) %>%
+  dplyr::group_by(cell_line) %>%
+  dplyr::summarise(
+    priming_index_vst  = mean(priming_index_vst,  na.rm = TRUE),
+    NOXA_MCL1_logratio = mean(NOXA_MCL1_logratio, na.rm = TRUE),
+    OBXsig_signed_z    = mean(OBXsig_signed_z,    na.rm = TRUE),
+    IC50_nM            = mean(IC50_nM,            na.rm = TRUE),
+    AUC_death          = mean(AUC_death,          na.rm = TRUE),
+    AUC_viability      = mean(AUC_viability,      na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::drop_na()
+
+get_residual_table <- function(df, x, y, slope_expect = c("neg","pos")) {
+  slope_expect <- match.arg(slope_expect)
+  fm  <- stats::lm(stats::reformulate(x, response = y), data = df)
+  aug <- broom::augment(fm, data = df) %>%
+    dplyr::transmute(
+      cell_line = df$cell_line,
+      x = .data[[x]], y = .data[[y]],
+      resid = .resid, resid_std = .std.resid
+    )
+  interpret <- if (slope_expect == "neg") {
+    ifelse(aug$resid < 0, "More sensitive than predicted",
+           ifelse(aug$resid > 0, "Less sensitive than predicted", "As predicted"))
+  } else {
+    ifelse(aug$resid > 0, "More sensitive than predicted",
+           ifelse(aug$resid < 0, "Less sensitive than predicted", "As predicted"))
+  }
+  aug %>%
+    dplyr::mutate(metric = x, endpoint = y,
+                  sensitivity_vs_pred = interpret) %>%
+    dplyr::select(cell_line, metric, endpoint, x, y, resid, resid_std, sensitivity_vs_pred)
+}
+
+# Priming-based residuals
+tab_ic50_prim  <- get_residual_table(per_line, "priming_index_vst",  "IC50_nM",       "neg")
+tab_aucD_prim  <- get_residual_table(per_line, "priming_index_vst",  "AUC_death",     "pos")
+tab_aucV_prim  <- get_residual_table(per_line, "priming_index_vst",  "AUC_viability", "neg")
+
+# OBXsig-based residuals
+tab_ic50_obxsig <- get_residual_table(per_line, "OBXsig_signed_z", "IC50_nM",       "neg")
+tab_aucD_obxsig <- get_residual_table(per_line, "OBXsig_signed_z", "AUC_death",     "pos")
+tab_aucV_obxsig <- get_residual_table(per_line, "OBXsig_signed_z", "AUC_viability", "neg")
+
+flag_deviation <- function(z) ifelse(is.na(z), "NA",
+                                     ifelse(abs(z) >= 3, "very_large",
+                                            ifelse(abs(z) >= 2, "large", "ok")))
+
+apply_flag <- function(df) df %>% dplyr::mutate(deviation_flag = flag_deviation(resid_std))
+
+out_dir <- file.path(out_root, "per_cell_line_residuals"); dir.create(out_dir, FALSE, TRUE)
+readr::write_csv(apply_flag(tab_ic50_prim),   file.path(out_dir, "residuals_PRIMING_vs_IC50.csv"))
+readr::write_csv(apply_flag(tab_aucD_prim),   file.path(out_dir, "residuals_PRIMING_vs_AUC_death.csv"))
+readr::write_csv(apply_flag(tab_aucV_prim),   file.path(out_dir, "residuals_PRIMING_vs_AUC_viability.csv"))
+readr::write_csv(apply_flag(tab_ic50_obxsig), file.path(out_dir, "residuals_OBXSIG_vs_IC50.csv"))
+readr::write_csv(apply_flag(tab_aucD_obxsig), file.path(out_dir, "residuals_OBXSIG_vs_AUC_death.csv"))
+readr::write_csv(apply_flag(tab_aucV_obxsig), file.path(out_dir, "residuals_OBXSIG_vs_AUC_viability.csv"))
+
+message(
+  "Done. Outputs in: ", out_root,
+  "\n- expr_matrix_vst_by_cellline.tsv",
+  "\n- priming_metrics_vst.csv",
+  "\n- obxsig_panel_metrics.csv",
+  "\n- obx_correlations.csv / obx_correlations_detailed.csv",
+  "\n- panel_UP_present.txt / panel_DOWN_present.txt (+ *_missing.txt)",
+  "\n- panel_gene_by_cellline_zscores.tsv",
+  "\n- plots/*_ONE_LABEL_PER_CELL_LINE.png",
+  "\n- per_cell_line_residuals/*.csv"
+)
+
+```
+
