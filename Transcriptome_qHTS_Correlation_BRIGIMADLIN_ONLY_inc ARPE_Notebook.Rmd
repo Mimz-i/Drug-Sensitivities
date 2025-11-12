@@ -1,0 +1,269 @@
+---
+title: "Mim's RNSseq STAR_RSEM ENSEMBL priming and gene expression correlations with full responders drug sensitivities - Brigimadlin ONLY w/ ARPE-19 - from qHTS results"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+
+```{r}
+# Transcriptome → Drug biomarker metrics & correlations: Brigimadlin (ARPE-inclusive, CSV)
+suppressPackageStartupMessages({
+  library(DESeq2); library(readr); library(dplyr); library(tidyr)
+  library(AnnotationDbi); library(org.Hs.eg.db)
+  library(ggplot2); library(ggrepel)
+  library(limma)     # removeBatchEffect
+  library(purrr)     # map_dfr
+  library(cowplot)   # side stamp
+  library(tibble); library(stringr)
+})
+
+# ===================== INPUTS =====================
+counts_csv_brig     <- "left_merged_STS_ARPE_Batches_1_2_gene_counts.csv"
+sampleinfo_csv_brig <- "sampleinfo_STS_DrugSens_ARPE_2025.csv"   # columns: name, Batch, cell_type
+brig_csv            <- "brigimadlin_metrics.csv"                 # columns: cell_line, IC50_nM, AUC
+
+out_root <- file.path(getwd(), "drug_panels_results"); dir.create(out_root, FALSE, TRUE)
+
+# helpers for consistent naming (ensures ARPE-19 appears)
+norm_name <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("\\s+", " ", x, perl = TRUE)
+  x <- gsub("_", "-", x, fixed = TRUE)
+  x <- gsub("\\bARPE\\s*[-_]?\\s*19\\b", "ARPE-19", x, ignore.case = TRUE, perl = TRUE)
+  x
+}
+
+# VST by cell line (ARPE-inclusive)
+ensure_vst_avg_brig <- function(counts_csv, sampleinfo_csv) {
+  if (exists("vst_avg_brig", inherits = TRUE)) return(get("vst_avg_brig", inherits = TRUE))
+
+  sampleinfo <- readr::read_csv(sampleinfo_csv, show_col_types = FALSE) |>
+    mutate(
+      name = trimws(name),
+      Batch = factor(trimws(as.character(Batch))),
+      cell_type = factor(norm_name(cell_type))
+    )
+
+  # make sure ARPE-19 is a kept level (even if only 1 sample)
+  if (!("ARPE-19" %in% levels(sampleinfo$cell_type))) {
+    sampleinfo$cell_type <- forcats::fct_expand(sampleinfo$cell_type, "ARPE-19")
+  }
+
+  rsem_counts <- readr::read_csv(counts_csv, show_col_types = FALSE)
+  gene_ids    <- rsem_counts$gene_id
+  cnt_mat     <- rsem_counts |> dplyr::select(-1, -2) |> as.data.frame() |> as.matrix()
+  rownames(cnt_mat) <- gene_ids
+
+  stopifnot(all(colnames(cnt_mat) %in% sampleinfo$name))
+  sampleinfo <- sampleinfo[match(colnames(cnt_mat), sampleinfo$name), , drop = FALSE]
+  stopifnot(all(colnames(cnt_mat) == sampleinfo$name))
+
+  keep <- rowSums(cnt_mat >= 10) >= 4
+  cnt_mat <- cnt_mat[keep, , drop = FALSE]
+
+  sym_map <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = rownames(cnt_mat),
+                                   column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+  cnt_sym <- cnt_mat[!is.na(sym_map), , drop = FALSE]
+  rownames(cnt_sym) <- sym_map[!is.na(sym_map)]
+  cnt_sym <- rowsum(cnt_sym, group = rownames(cnt_sym))
+
+  dds <- DESeqDataSetFromMatrix(countData = round(cnt_sym),
+                                colData   = sampleinfo,
+                                design    = ~ Batch + cell_type)
+  vsd <- vst(dds, blind = FALSE)
+  vst_mat <- assay(vsd)
+
+  vst_bc <- limma::removeBatchEffect(
+    vst_mat,
+    batch  = colData(vsd)$Batch,
+    design = model.matrix(~ cell_type, data = as.data.frame(colData(vsd)))
+  )
+
+  # use the normalised cell_type as the "cell_line" label (keeps ARPE-19)
+  cell_labels <- norm_name(as.character(colData(vsd)$cell_type))
+
+  vst_df <- as.data.frame(vst_bc) |>
+    tibble::rownames_to_column("gene") |>
+    tidyr::pivot_longer(-gene, names_to = "sample", values_to = "vst") |>
+    mutate(cell_line = cell_labels[match(sample, colnames(vst_bc))]) |>
+    group_by(gene, cell_line) |>
+    summarise(vst = mean(vst, na.rm = TRUE), .groups = "drop") |>
+    tidyr::pivot_wider(names_from = cell_line, values_from = vst)
+
+  readr::write_tsv(vst_df, file.path(out_root, "expr_matrix_vst_by_cellline_Brig.tsv"))
+  assign("vst_avg_brig", vst_df, envir = .GlobalEnv)
+  vst_df
+}
+
+vst_avg <- ensure_vst_avg_brig(counts_csv_brig, sampleinfo_csv_brig)
+
+# z-score by gene across cell lines (includes ARPE-19 column if present in sampleinfo)
+mat_gxcl  <- vst_avg |> tibble::column_to_rownames("gene") |> as.matrix()
+z_gxcl    <- t(scale(t(mat_gxcl)))
+z_df      <- as.data.frame(z_gxcl) |> tibble::rownames_to_column("gene")
+
+# Brigimadlin gene set metric (no TP53/MDM2 gating)
+p53_targets <- c("CDKN1A","MDM2","BBC3","PMAIP1","BAX","GADD45A","FAS")
+
+make_brig_metrics <- function() {
+  present <- intersect(p53_targets, rownames(z_gxcl))
+  if (length(present) == 0) stop("None of the p53 target genes found in VST matrix.")
+  p53_index <- colMeans(z_gxcl[present, , drop = FALSE], na.rm = TRUE)
+  tibble::tibble(
+    cell_line = norm_name(names(p53_index)),
+    p53_target_z = as.numeric(p53_index)
+  )
+}
+
+# IO helpers (drug table, stats, plotting)
+read_drug_table <- function(csv_path) {
+  readr::read_csv(csv_path, col_types = readr::cols(
+    cell_line = readr::col_character(),
+    IC50_nM   = readr::col_double(),
+    AUC       = readr::col_double()
+  )) |>
+    mutate(
+      cell_line = norm_name(cell_line),
+      AUC_death = AUC,
+      AUC_viability = 1 - AUC
+    )
+}
+
+summarize_corr <- function(df, x, y) {
+  sub <- df |> dplyr::select(x = !!rlang::sym(x), y = !!rlang::sym(y)) |> tidyr::drop_na()
+  n   <- nrow(sub)
+  pe  <- if (n >= 3) suppressWarnings(cor.test(sub$x, sub$y, method = "pearson"))  else NULL
+  sp  <- if (n >= 3) suppressWarnings(cor.test(sub$x, sub$y, method = "spearman")) else NULL
+  tibble::tibble(
+    n            = n,
+    pearson_r    = if (!is.null(pe)) unname(pe$estimate)  else NA_real_,
+    pearson_p    = if (!is.null(pe)) pe$p.value           else NA_real_,
+    pearson_r2   = if (!is.null(pe)) unname(pe$estimate)^2 else NA_real_,
+    spearman_rho = if (!is.null(sp)) unname(sp$estimate)  else NA_real_,
+    spearman_p   = if (!is.null(sp)) sp$p.value           else NA_real_
+  )
+}
+
+get_stats_label <- function(stats_df, metric, endpoint) {
+  row <- stats_df |> dplyr::filter(metric == !!metric, endpoint == !!endpoint)
+  if (nrow(row) != 1) return("n = NA\nr = NA (p=NA),  r² = NA\nρ = NA (p=NA)")
+  fmt <- function(x, d = 2) {
+    x <- as.numeric(x)
+    if (is.na(x)) "NA" else if (x < 1e-3) formatC(x, format = "e", digits = 1) else formatC(x, format = "f", digits = d)
+  }
+  paste0(
+    "n = ", row$n,
+    "\nr = ", fmt(row$pearson_r), " (p=", fmt(row$pearson_p), "),  r² = ", fmt(row$pearson_r2),
+    "\nρ = ", fmt(row$spearman_rho), " (p=", fmt(row$spearman_p), ")"
+  )
+}
+
+plot_one <- function(dat, xvar, yvar, title_prefix = "", stats_df = NULL,
+                     y_ic50_range = NULL, y_auc_range = NULL) {
+  df <- dat |> dplyr::select(cell_line, x = !!rlang::sym(xvar), y = !!rlang::sym(yvar)) |> tidyr::drop_na()
+  df_lab <- df |> dplyr::group_by(cell_line) |> dplyr::summarise(x = mean(x, na.rm = TRUE), y = mean(y, na.rm = TRUE), .groups = "drop")
+
+  p <- ggplot(df, aes(x, y)) +
+    geom_point(size = 2.6, alpha = 0.75) +
+    ggrepel::geom_text_repel(data = df_lab, aes(label = cell_line), size = 3.2, max.overlaps = Inf, seed = 42) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.6) +
+    labs(title = paste(title_prefix, paste(yvar, "vs", xvar)), x = xvar, y = yvar) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "none", plot.margin = margin(10, 10, 10, 10))
+
+  if (!is.null(y_ic50_range) && yvar == "IC50_nM") p <- p + scale_y_continuous(limits = y_ic50_range)
+  if (!is.null(y_auc_range)  && yvar %in% c("AUC_death","AUC_viability")) p <- p + scale_y_continuous(limits = y_auc_range)
+
+  if (is.null(stats_df)) return(p)
+
+  stats_lab <- get_stats_label(stats_df, metric = xvar, endpoint = yvar)
+  nl   <- length(strsplit(stats_lab, "\n")[[1]])
+  s_w  <- 0.18
+  s_h  <- min(0.45, max(0.22, 0.055 * nl + 0.06))
+  s_y  <- (1 - s_h) / 2
+  stamp_plot <- ggplot() +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
+    theme_void() +
+    annotate("rect", xmin = 0, xmax = 1, ymin = 0, ymax = 1,
+             fill = "white", alpha = 1, colour = "grey85", linewidth = 0.35) +
+    annotate("text", x = 0.04, y = 0.5, hjust = 0, vjust = 0.5,
+             label = stats_lab, size = 2.4, lineheight = 1.05)
+
+  cowplot::ggdraw() +
+    cowplot::draw_plot(p,           x = 0,        y = 0,   width = 1 - s_w, height = 1, hjust = 0, vjust = 0) +
+    cowplot::draw_plot(stamp_plot,  x = 1 - s_w,  y = s_y, width = s_w,     height = s_h, hjust = 0, vjust = 0)
+}
+
+save_plot <- function(p, file, w = 7.2, h = 5.0, dpi = 600) {
+  dir.create(dirname(file), showWarnings = FALSE, recursive = TRUE)
+  ggsave(file, p, width = w, height = h, dpi = dpi)
+}
+
+# BRIGIMADLIN (All lines, including ARPE-19)
+{
+  out_dir <- file.path(out_root, "brigimadlin"); dir.create(out_dir, FALSE, TRUE)
+
+  brig_metrics <- make_brig_metrics()
+
+  # normalise names in drug CSV to ensure ARPE-19 matches
+  drug_brig <- read_drug_table(brig_csv)
+
+  # inner join keeps only lines with drug data; ARPE-19 will be included if present in brigimadlin_metrics.csv
+  dat_brig  <- dplyr::inner_join(drug_brig, brig_metrics, by = "cell_line")
+
+  readr::write_csv(brig_metrics, file.path(out_dir, "brigimadlin_biomarkers.csv"))
+
+  metrics   <- c("p53_target_z")
+  endpoints <- c("IC50_nM","AUC_death","AUC_viability")
+
+  corr_tbl <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      sub <- dat_brig |> dplyr::select(all_of(c("cell_line", m, e))) |> tidyr::drop_na()
+      tibble::tibble(
+        metric = m, endpoint = e, n = nrow(sub),
+        pearson  = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "pearson")  else NA_real_,
+        spearman = if (nrow(sub) >= 3) cor(sub[[m]], sub[[e]], method = "spearman") else NA_real_
+      )
+    })
+  })
+  readr::write_csv(corr_tbl, file.path(out_dir, "brigimadlin_correlations.csv"))
+
+  det <- purrr::map_dfr(metrics, function(m) {
+    purrr::map_dfr(endpoints, function(e) {
+      summarize_corr(dat_brig, m, e) |>
+        dplyr::mutate(metric = m, endpoint = e, .before = 1)
+    })
+  }) |> dplyr::mutate(across(where(is.double), as.numeric))
+  readr::write_csv(det, file.path(out_dir, "brigimadlin_correlations_detailed.csv"))
+
+  y_ic50_range <- range(dat_brig$IC50_nM, na.rm = TRUE)
+  y_auc_range  <- range(c(dat_brig$AUC_death, dat_brig$AUC_viability), na.rm = TRUE)
+
+  for (e in endpoints) {
+    p <- plot_one(dat_brig, "p53_target_z", e, title_prefix = "Brigimadlin:",
+                  stats_df = det, y_ic50_range = y_ic50_range, y_auc_range = y_auc_range)
+    save_plot(p, file.path(out_dir, paste0(e, "_vs_p53_target_z.png")))
+  }
+}
+
+message(
+  "\nDone. Outputs in: ", out_root,
+  "\n- expr_matrix_vst_by_cellline_Brig.tsv (includes ARPE-19 column if present in sampleinfo)",
+  "\n- brigimadlin_biomarkers.csv",
+  "\n- brigimadlin_correlations.csv and brigimadlin_correlations_detailed.csv",
+  "\n- PNG plots for IC50_nM / AUC_death / AUC_viability vs p53_target_z\n"
+)
+
+```
+
